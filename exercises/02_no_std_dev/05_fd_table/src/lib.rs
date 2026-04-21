@@ -47,17 +47,25 @@ pub trait File: Send + Sync {
 }
 
 /// File descriptor table
+/// fd是一个编号，指向一个文件对象（实现了File trait的对象）
+/// FdTable是一个将fd映射到文件对象的结构
+/// Arc 是为了把这个文件对象拿出去一份使用，而不能把表里的对象move走
+/// Arc也让一个文件对象可能被多个fd共享（比如dup2），或者被多个线程共享
 pub struct FdTable {
     // TODO: Design the internal structure
     // Hint: use Vec<Option<Arc<dyn File>>>
     //       the index is the fd number, None means the fd is closed or unallocated
+    fds: Vec<Option<Arc<dyn File>>>,
+
 }
 
 impl FdTable {
     /// Create an empty fd table
     pub fn new() -> Self {
         // TODO
-        todo!()
+        Self { 
+            fds: Vec::new(),
+        }
     }
 
     /// Allocate a new fd, return the fd number.
@@ -65,25 +73,51 @@ impl FdTable {
     /// Prefers reusing the smallest closed fd number; if no free slot, appends to the end.
     pub fn alloc(&mut self, file: Arc<dyn File>) -> usize {
         // TODO
-        todo!()
+        for (i, v) in self.fds.iter_mut().enumerate() {
+            match v {
+                Some(_) => continue,
+                None => {
+                    *v = Some(Arc::clone(&file));
+                    return i;
+                }
+            }
+        }
+
+        let fd = self.fds.len();
+        self.fds.push(Some(Arc::clone(&file)));
+        fd
     }
 
     /// Get the file object for an fd. Returns None if the fd doesn't exist or is closed.
     pub fn get(&self, fd: usize) -> Option<Arc<dyn File>> {
         // TODO
-        todo!()
+        if fd >= self.fds.len(){
+            return None;
+        }
+
+        self.fds[fd].clone()
     }
 
     /// Close an fd. Returns true on success, false if the fd doesn't exist or is already closed.
     pub fn close(&mut self, fd: usize) -> bool {
         // TODO
-        todo!()
+        if fd >= self.fds.len() {
+            return false;
+        }
+        let slot = &mut self.fds[fd];
+        match slot {
+            Some(_) => {
+                *slot = None;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Return the number of currently allocated fds (excluding closed ones)
     pub fn count(&self) -> usize {
         // TODO
-        todo!()
+        self.fds.iter().filter(|v| v.is_some()).count()
     }
 }
 
