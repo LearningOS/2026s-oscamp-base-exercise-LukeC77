@@ -51,9 +51,9 @@ pub enum ThreadState {
 struct GreenThread {
     ctx: TaskContext,
     state: ThreadState,
-    _stack: Option<Vec<u8>>,
+    _stack: Option<Vec<u8>>, // _变量名 = 只是为了“持有资源”，但不直接使用, 这个字段的存在是为了 保证栈内存不被释放
     /// User entry; taken once when the thread is first scheduled and passed to `thread_wrapper`.
-    entry: Option<extern "C" fn()>,
+    entry: Option<extern "C" fn()>, // 第一次运行 → take() → 变成 None, 防止重复执行 entry（严重错误）
 }
 
 /// Set by the scheduler before switching to a new thread; `thread_wrapper` reads and calls it once.
@@ -61,7 +61,7 @@ static mut CURRENT_THREAD_ENTRY: Option<extern "C" fn()> = None;
 
 /// Wrapper run as the initial `ra` for each green thread: call the user entry (from `CURRENT_THREAD_ENTRY`), then mark Finished and switch back.
 extern "C" fn thread_wrapper() {
-    let entry = unsafe { core::ptr::read(&raw const CURRENT_THREAD_ENTRY) };
+    let entry = unsafe { core::ptr::read(&raw const CURRENT_THREAD_ENTRY) }; // Rust 对 static mut 有严格限制, 只能通过 raw pointer + unsafe
     if let Some(f) = entry {
         unsafe { CURRENT_THREAD_ENTRY = None };
         f();
@@ -112,7 +112,7 @@ unsafe extern "C" fn switch_context(_old: &mut TaskContext, _new: &TaskContext) 
 
 pub struct Scheduler {
     threads: Vec<GreenThread>,
-    current: usize,
+    current: usize, // index of the currently running thread in `threads`
 }
 
 impl Scheduler {
@@ -120,7 +120,7 @@ impl Scheduler {
         let main_thread = GreenThread {
             ctx: TaskContext::default(),
             state: ThreadState::Running,
-            _stack: None,
+            _stack: None, // 主线程的栈不是你分配的，而是由操作系统提供的，所以我们不持有它的所有权
             entry: None,
         };
 
@@ -137,7 +137,21 @@ impl Scheduler {
     ///    `sp` must be 16-byte aligned (e.g. `(stack_top - 16) & !15` to leave headroom).
     /// 3. Push a `GreenThread` with this context, state `Ready`, and `entry` stored for the wrapper to call.
     pub fn spawn(&mut self, entry: extern "C" fn()) {
-        todo!("alloc stack, init ctx with ra=thread_wrapper and aligned sp, push GreenThread(Ready, entry)")
+        //todo!("alloc stack, init ctx with ra=thread_wrapper and aligned sp, push GreenThread(Ready, entry)")
+        let stack = vec![0u8; STACK_SIZE];
+        let stack_top = (stack.as_ptr() as usize + STACK_SIZE - 16) & !0xf; // align down to 16 bytes
+        let ctx = TaskContext {
+            sp: stack_top as u64,
+            ra: thread_wrapper as u64,
+            ..Default::default()
+        };
+        let thread = GreenThread {
+            ctx,
+            state: ThreadState::Ready,
+            _stack: Some(stack),
+            entry: Some(entry),
+        };
+        self.threads.push(thread);
     }
 
     /// Run the scheduler until all threads (except the main one) are `Finished`.
@@ -146,12 +160,56 @@ impl Scheduler {
     /// 2. Loop: if all threads in `threads[1..]` are `Finished`, break; otherwise call `schedule_next()` (which may switch away and later return).
     /// 3. Clear `SCHEDULER` when done.
     pub fn run(&mut self) {
-        todo!("set SCHEDULER to self, loop until threads[1..] all Finished, call schedule_next, then clear SCHEDULER")
+        //todo!("set SCHEDULER to self, loop until threads[1..] all Finished, call schedule_next, then clear SCHEDULER")
+        unsafe { SCHEDULER = self as *mut Scheduler; } // Rust规定所有对 static mut 的读写 都必须在 unsafe 中
+        loop {
+            let all_done = self.threads[1..].iter().all(|t| t.state == ThreadState::Finished);
+            if all_done {
+                break;
+            }
+            self.schedule_next();
+        }
+        unsafe { SCHEDULER = std::ptr::null_mut(); }
     }
 
     /// Find the next ready thread (starting from `current + 1` round-robin), mark current as `Ready` (if not `Finished`), mark next as `Running`, set `CURRENT_THREAD_ENTRY` if the next thread has an entry, then switch to it.
     fn schedule_next(&mut self) {
-        todo!("round-robin find next Ready, set current Ready (if not Finished), next Running, CURRENT_THREAD_ENTRY, then switch_context")
+        //todo!("round-robin find next Ready, set current Ready (if not Finished), next Running, CURRENT_THREAD_ENTRY, then switch_context")
+        let current = self.current;
+        let mut next_id = current + 1;
+        if next_id >= self.threads.len() {
+            next_id = 0;
+        }
+        loop {
+            if self.threads[next_id].state == ThreadState::Ready {
+                match self.threads[current].state {
+                    ThreadState::Finished => {},
+                    _ => self.threads[current].state = ThreadState::Ready,
+                }
+                self.threads[next_id].state = ThreadState::Running;
+                if let Some(entry) = self.threads[next_id].entry.take() {
+                    unsafe { CURRENT_THREAD_ENTRY = Some(entry); }
+                }
+                // current_ctx是可变引用，next_ctx是不可变引用；如果直接从threads里取一个可变引用一个不可变引用会违反借用规则，
+                // 所以我们先 split_at_mut 切成两半，保证 current_ctx 和 next_ctx 不在同一半里
+                let (current_ctx, next_ctx) = if current < next_id {
+                    let (left, right) = self.threads.split_at_mut(next_id);
+                    (&mut left[current].ctx, &right[0].ctx)
+                } else {
+                    let (left, right) = self.threads.split_at_mut(current);
+                    (&mut right[0].ctx, &left[next_id].ctx)
+                };
+                self.current = next_id;
+                unsafe { switch_context(current_ctx, next_ctx); }
+                break;
+            } else {
+                next_id += 1;
+                if next_id >= self.threads.len() {
+                    next_id = 0;
+                }
+            }
+        }
+
     }
 }
 
