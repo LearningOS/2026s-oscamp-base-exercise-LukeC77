@@ -53,12 +53,12 @@ const PPN_MASK: u64 = (1u64 << 44) - 1; // 44-bit PPN
 /// PPN occupies bits [53:10], flags occupy bits [7:0].
 ///
 /// Example: ppn=0x12345, flags=PTE_V|PTE_R|PTE_W
-/// Result should be: (0x12345 << 10) | 0b111 = 0x48D14007
+/// Result should be: (0x12345 << 10) | 0b111 = 0x48D1407
 ///
 /// Hint: Shift PPN left by PPN_SHIFT bits, then OR with flags.
 pub fn make_pte(ppn: u64, flags: u64) -> u64 {
     // TODO: Construct page table entry using ppn and flags
-    todo!()
+    (ppn & PPN_MASK) << PPN_SHIFT | (flags & 0xFF)
 }
 
 /// Extract physical page number (PPN) from page table entry.
@@ -66,28 +66,32 @@ pub fn make_pte(ppn: u64, flags: u64) -> u64 {
 /// Hint: Right shift by PPN_SHIFT bits, then AND with PPN_MASK.
 pub fn extract_ppn(pte: u64) -> u64 {
     // TODO: Extract PPN from pte
-    todo!()
+    pte >> PPN_SHIFT & PPN_MASK
 }
 
 /// Extract flags (lower 8 bits) from page table entry.
 pub fn extract_flags(pte: u64) -> u64 {
     // TODO: Extract lower 8-bit flags
-    todo!()
+    pte & 0xFF
 }
 
 /// Check whether page table entry is valid (V bit set).
 pub fn is_valid(pte: u64) -> bool {
     // TODO: Check PTE_V
-    todo!()
+    (pte & PTE_V) != 0
 }
 
 /// Determine whether page table entry is a leaf PTE.
 ///
 /// In SV39, if any of R, W, X bits is set, the PTE is a leaf,
 /// pointing to the final physical page. Otherwise it points to next-level page table.
+/// 
+/// 因为在 RISC-V 规范里，R/W/X 被定义为“对被映射页面本身的访问权限”。
+/// 如果 R/W/X 全是 0，说明它不是在描述“一个页面可怎么访问”，而是在描述“下一层页表在哪”，所以是中间节点。
+/// 只要 R/W/X 任一位为 1，就已经在声明最终页面权限了，硬件就把它当作最终映射项，不再继续下钻，所以是叶子项。
 pub fn is_leaf(pte: u64) -> bool {
     // TODO: Check if any of R/W/X bits is set
-    todo!()
+    (pte & (PTE_R | PTE_W | PTE_X)) != 0
 }
 
 /// Check whether page table entry permits the requested access based on given permissions.
@@ -97,9 +101,39 @@ pub fn is_leaf(pte: u64) -> bool {
 /// - `execute`: requires execute permission
 ///
 /// Returns true iff: PTE is valid, and each requested permission is satisfied.
+/// 
+/// Valid (V) 的作用是标记“这个 PTE 当前是否可用”。
+/// V=1：这个条目是有效格式，硬件可以按它继续解释（下级表或叶子映射）。
+/// V=0：这个条目无效，硬件把它当作不存在映射，访问会触发 page fault。
+/// 
+/// 为什么要允许无效：
+/// 表示未映射区域：不是所有虚拟地址都要映射。
+/// 支持按需分配：先留空，访问时再分配物理页（demand paging）。
+/// 支持回收/换出：页被回收后把 PTE 置无效。
+/// 安全隔离：防止访问不该访问的地址范围。
+/// 所以 V 是页表里最基础的“是否存在映射”开关。
+/// 
+/// 
+/// 正确规则是：
+/// request 里为 true 的权限，pte 里必须也为 true。
+/// request 里为 false 的权限，pte 里可以是 false 或 true，都不影响这次访问。
+/// 
 pub fn check_permission(pte: u64, read: bool, write: bool, execute: bool) -> bool {
     // TODO: First check if valid, then check each requested permission
-    todo!()
+    if (pte & PTE_V) == 0 {
+        return false; // Not valid
+    }
+
+    if read && (pte & PTE_R) == 0 {
+        return false; // Read requested but not allowed
+    }
+    if write && (pte & PTE_W) == 0 {
+        return false; // Write requested but not allowed
+    }
+    if execute && (pte & PTE_X) == 0 {
+        return false; // Execute requested but not allowed
+    }
+    true
 }
 
 #[cfg(test)]
