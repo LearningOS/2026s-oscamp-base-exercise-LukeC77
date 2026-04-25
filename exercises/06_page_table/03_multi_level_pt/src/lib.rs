@@ -18,13 +18,42 @@
 //! │  9 bits  │  9 bits   │  9 bits   │  12 bits  │
 //! └──────────┴───────────┴───────────┴───────────┘
 //! ```
+//! 
+//! 
+//! 总结成一版完整的 SV39 数据结构描述如下：
+// 1. 基本单位  
+// - 物理内存按 **4KB 页**组织，`PAGE_SIZE = 4096`。  
+// - “4KB 页”只是容器，既可以是**数据页**，也可以是**页表页**。
+
+// 2. 页表页结构  
+// - 一张页表页大小也是 4KB。  
+// - 每个 PTE 是 8B，所以每张页表有 `4096 / 8 = 512` 个表项（`PT_ENTRIES = 512`）。  
+// - 512 = `2^9`，因此每一级索引都是 9 bit。
+
+// 3. 虚拟地址分解（SV39）  
+// - VA = `VPN[2](9)` | `VPN[1](9)` | `VPN[0](9)` | `offset(12)`。  
+// - `offset=12` 只由 4KB 页大小决定，和几级页表无关。
+
+// 4. 三级页表遍历  
+// - 用 `VPN[2]` 在根页表（L2）512 项中选一个 PTE。  
+// - 若该 PTE 非叶子，则指向下一张页表（L1）。  
+// - 用 `VPN[1]` 在 L1 选 PTE；若仍非叶子，则到 L0。  
+// - 用 `VPN[0]` 在 L0 选 PTE；通常这里是叶子，给出物理页号 PPN。  
+// - 最终物理地址：`PA = (PPN << 12) + offset`。
+
+// 5. 叶子与大页  
+// - 叶子不一定只在 L0。  
+// - L1 叶子可映射 2MB superpage，L2 叶子可映射 1GB superpage。  
+// - 原理不变：高位由叶子 PTE 决定，低位由 VA 的对应偏移位保留。
+
+// 一句话：SV39 是“用三级 9-bit 索引在 4KB 页表页中逐级找 PTE，最后用 12-bit offset 落到目标物理页内字节”。
 
 use std::collections::HashMap;
 
 /// 页大小 4KB
-pub const PAGE_SIZE: usize = 4096;
+pub const PAGE_SIZE: usize = 4096; // 2^12, 一个页表占用 4096 字节， 在这个练习（RISC-V SV39）里，标准基页就是 4KB
 /// 每级页表有 512 个条目 (2^9)
-pub const PT_ENTRIES: usize = 512;
+pub const PT_ENTRIES: usize = 512; // 每个PTE是8个字节，512个PTE占用4096字节，正好一页。
 
 /// PTE 标志位
 pub const PTE_V: u64 = 1 << 0;
@@ -33,12 +62,12 @@ pub const PTE_W: u64 = 1 << 2;
 pub const PTE_X: u64 = 1 << 3;
 
 /// PPN 在 PTE 中的偏移
-const PPN_SHIFT: u32 = 10;
+const PPN_SHIFT: u32 = 10; // PTE 中 PPN 从 bit 10 开始，占 44 位（53:10）
 
 /// 页表节点：一个包含 512 个条目的数组
 #[derive(Clone)]
 pub struct PageTableNode {
-    pub entries: [u64; PT_ENTRIES],
+    pub entries: [u64; PT_ENTRIES], // key是ppn，value是pte
 }
 
 impl PageTableNode {
@@ -103,7 +132,8 @@ impl Sv39PageTable {
     /// 提示：右移 (12 + level * 9) 位，然后与 0x1FF 做掩码。
     pub fn extract_vpn(va: u64, level: usize) -> usize {
         // TODO: 从虚拟地址中提取指定级别的 VPN 索引
-        todo!()
+        let right_shift = 12 + level * 9; // 计算右移位数
+        ((va >> right_shift) & 0x1FF) as usize// 取出 9 位 VPN 索引
     }
 
     /// 建立从虚拟页到物理页的映射（4KB 页）。
@@ -119,7 +149,39 @@ impl Sv39PageTable {
         // 对于中间层级（level 2 和 level 1），如果对应 VPN 的页表项（PTE）无效（PTE_V == 0），
         // 则需要分配一个新的页表节点（使用 alloc_node），并将新节点的 PPN 写入当前 PTE（仅设置 PTE_V 标志）。
         // 最后在 level 0 的 PTE 中写入目标物理页号（pa >> 12）和 flags。
-        todo!()
+        let vpn2 = Self::extract_vpn(va, 2);
+        let vpn1 = Self::extract_vpn(va, 1);
+        let vpn0 = Self::extract_vpn(va, 0);
+
+        // 从根页表开始
+        let root_table = self.nodes.get(&self.root_ppn).unwrap();
+        
+        // 处理level 2的PTE
+        let mut level2_pte = root_table.entries[vpn2];
+        // 如果无效，分配新节点并更新PTE
+        if level2_pte & PTE_V == 0 {
+            // 分配新的页表节点
+            let new_ppn = self.alloc_node();
+            // 更新level2_pte, 设置PTE_V并写入新节点的PPN
+            level2_pte = (new_ppn << PPN_SHIFT) | PTE_V;
+            self.nodes.get_mut(&self.root_ppn).unwrap().entries[vpn2] = level2_pte;
+        }
+
+        let level2_table = self.nodes.get(&(level2_pte >> PPN_SHIFT)).unwrap();
+
+        // 处理level 1的PTE
+        let mut level1_pte = level2_table.entries[vpn1];
+        // 如果无效，分配新节点并更新PTE
+        if level1_pte & PTE_V == 0 {
+            let new_ppn = self.alloc_node();
+            // 更新level1_pte, 设置PTE_V并写入新节点的PPN
+            level1_pte = (new_ppn << PPN_SHIFT) | PTE_V;
+            self.nodes.get_mut(&(level2_pte >> PPN_SHIFT)).unwrap().entries[vpn1] = level1_pte;
+        }
+
+        // 处理level 0的PTE，直接写入物理页号和flags
+        let level0_pte = ((pa >> 12) << PPN_SHIFT) | flags; // 物理页号和标志位
+        self.nodes.get_mut(&(level1_pte >> PPN_SHIFT)).unwrap().entries[vpn0] = level0_pte;
     }
 
     /// 遍历三级页表，将虚拟地址翻译为物理地址。
@@ -141,8 +203,88 @@ impl Sv39PageTable {
         // 如果 PTE 是叶节点（即 R、W、X 标志位中有至少一个被置位），则可以直接使用该 PTE 中的物理页号（PPN）计算最终的物理地址。
         // 否则，该 PTE 指向下一级页表节点，继续遍历下一级。
         // 遍历到 level 0 时，PTE 必须是叶节点。
-        todo!()
+        let vpn2 = Self::extract_vpn(va, 2);
+        let vpn1 = Self::extract_vpn(va, 1);
+        let vpn0 = Self::extract_vpn(va, 0);
+
+        // 从根页表开始
+        let root_table = self.nodes.get(&self.root_ppn).unwrap();
+
+        // 处理level 2的PTE
+        let level2_pte = root_table.entries[vpn2];
+        if (level2_pte & PTE_V) == 0 {
+            return TranslateResult::PageFault; // level 2 PTE 无效
+        }
+        if level2_pte & (PTE_R | PTE_W | PTE_X) != 0 {
+            // level 2 是叶子，计算物理地址
+            let ppn = level2_pte >> PPN_SHIFT;
+            let pa = (ppn << 12) | (va & ((1 << 30) - 1)); // 大页偏移：VPN[1:0] + 12 位页内偏移
+            return TranslateResult::Ok(pa);
+        }
+        let level2_table = self.nodes.get(&(level2_pte >> PPN_SHIFT)).unwrap();
+
+        // 处理level 1的PTE
+        let level1_pte = level2_table.entries[vpn1];
+        if (level1_pte & PTE_V) == 0 {
+            return TranslateResult::PageFault; // level 1 PTE 无效
+        }
+        if level1_pte & (PTE_R | PTE_W | PTE_X) != 0 {
+            // level 1 是叶子，计算物理地址
+            let ppn = level1_pte >> PPN_SHIFT;
+            let pa = (ppn << 12) | (va & ((1 << 21) - 1)); // 大页偏移：VPN[0] + 12 位页内偏移
+            return TranslateResult::Ok(pa);
+        }
+        
+        // 处理level 0的PTE
+        let level0_pte = self.nodes.get(&(level1_pte >> PPN_SHIFT)).unwrap().entries[vpn0];
+        if (level0_pte & PTE_V) == 0 {
+            return TranslateResult::PageFault; // level 0 PTE 无效
+        }
+        if level0_pte & (PTE_R | PTE_W | PTE_X) == 0 {
+            return TranslateResult::PageFault; // level 0 PTE 不是叶子
+        }
+        let ppn = level0_pte >> PPN_SHIFT;
+        let pa = (ppn << 12) | (va & 0xFFF); // 页内偏移
+        TranslateResult::Ok(pa)
     }
+/// 对于translate中计算pa的疑问：
+/// ppn是从root_ppn逐渐递增得到的。为什么ppn * PAGE_SIZE + offset正好是物理地址？ 如果这个ppn前有一些PTE table的页，是不是就错乱了？
+/// 答：
+/// 关键在于：页表页本来就是物理页的一种，不会“错乱”。
+/// - PPN 是“物理页号”，全局编号，不区分“数据页”还是“页表页”。
+/// - PPN * PAGE_SIZE 永远只是把“页号”换算成“这个页的物理起始地址”。
+/// - + offset 是页内偏移，所以公式始终成立。
+/// 
+/// 你担心的“前面有很多页表页”其实没问题，因为：
+/// 1. 页表页也占物理内存，这是正常的。
+/// 2. 数据页和页表页都在同一个物理地址空间里，只是用途不同。
+/// 3. 公式不关心用途，只做地址换算。
+
+
+
+
+/// 关于 map_superpage 的问题：
+/// 为什么va和pa要和2MB对齐，三级页表也没有要求对齐啊，解释原因。mega_size是一页的大小有2MB，也就是能存2MB的内容吗？va的vpn2,vpn1,vpn0和offset大小是否有改变
+/// 答：
+/// - 为什么 2MB 对齐
+///     4KB 普通页是 L0 叶子，页内偏移是 12 位。
+///     2MB 大页是 L1 叶子，此时 VPN[0] 不再参与查下一级，而是并入偏移。
+///     所以偏移变成 21 位（VPN[0] 9 位 + 原 offset 12 位）。
+///     这要求映射基址 va 和 pa 的低 21 位必须为 0，也就是 2MB 对齐。
+/// - “三级页表没要求对齐”这句话怎么理解
+///     三级结构本身一直在。
+///     对齐要求是“当你在某层做叶子映射时”才有的：
+///     L0 叶子 -> 4KB 对齐
+///     L1 叶子 -> 2MB 对齐
+///     L2 叶子 -> 1GB 对齐
+/// - mega_size = 2MB 是什么
+///     不是“页表页大小”。页表页始终 4KB。
+///     它是“一条 L1 叶子 PTE 能覆盖的虚拟地址范围”，即 2MB 连续内存内容。
+/// - va 的 vpn2/vpn1/vpn0/offset 会变吗
+///     位宽不变：还是 9/9/9/12。
+///     变的是翻译时的用法：
+///     普通页（L0 叶子）：offset 用低 12 位
+///     2MB 大页（L1 叶子）：offset 用低 21 位 (VPN[0]+12位offset)
 
     /// 建立大页映射（2MB superpage，在 level 1 设叶子 PTE）。
     ///
@@ -160,7 +302,25 @@ impl Sv39PageTable {
         // 你需要在 level 2 找到或创建中间页表节点，然后在 level 1 写入叶子 PTE。
         // 注意大页的物理页号计算方式与普通页相同（pa >> 12），
         // 但翻译时 offset 包含虚拟地址的低 21 位（VPN[0] 部分 + 12 位页内偏移）。
-        todo!()
+        
+        let vpn2 = Self::extract_vpn(va, 2);
+        let vpn1 = Self::extract_vpn(va, 1);
+
+        // 从根页表开始
+        let root_table = self.nodes.get(&self.root_ppn).unwrap();
+
+        // 处理level 2的PTE
+        let mut level2_pte = root_table.entries[vpn2];
+        // 如果无效，分配新节点并更新PTE
+        if level2_pte & PTE_V == 0 {
+            let new_ppn = self.alloc_node();
+            level2_pte = (new_ppn << PPN_SHIFT) | PTE_V;
+            self.nodes.get_mut(&self.root_ppn).unwrap().entries[vpn2] = level2_pte;
+        }
+
+        // 处理level 1的PTE，直接写入物理页号和flags
+        let level1_pte = ((pa >> 12) << PPN_SHIFT) | flags; // 物理页号和标志位
+        self.nodes.get_mut(&(level2_pte >> PPN_SHIFT)).unwrap().entries[vpn1] = level1_pte;
     }
 }
 
