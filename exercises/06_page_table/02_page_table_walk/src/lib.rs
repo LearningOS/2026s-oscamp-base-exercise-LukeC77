@@ -17,6 +17,18 @@
 //! └──────────────┴────────────┘
 //!
 //! Page size: 4KB (2^12 = 4096 bytes)
+//! 
+//! offset有12位，所以它能表示2^12=4096个位置，一页有4096字节，因此页大小为4KB。
+//! 
+//! 关系链路就是：virtual address -> 拆成 VPN + offset -> 用 VPN 找 PTE -> 取 PPN -> 和 offset 拼成 physical address。
+//! 
+//! VPN找PTE在单级页表里通常是这样：
+//! - 页表是一个 PTE 数组，page_table[vpn] 就是对应的 PTE。
+//! - 硬件/内核先拿到页表基址（PTBR），PTBR 指向页表起始地址。
+//! - 用 VPN 计算 PTE 地址：
+//!     - pte_addr = PTBR + vpn * sizeof(PTE)   页表由若干 PTE 组成，每个 PTE 大小固定，vpn 就是索引。
+//!     - 读出该 PTE，检查 valid 位等标志。
+//! - 若有效则取出 PPN
 //! ```
 
 /// 页大小 4KB
@@ -25,9 +37,13 @@ pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_OFFSET_BITS: u32 = 12;
 
 /// 页表项标志
-pub const PTE_VALID: u8 = 1 << 0;
-pub const PTE_READ: u8 = 1 << 1;
-pub const PTE_WRITE: u8 = 1 << 2;
+/// 目的：
+/// - 内存保护，防止程序乱写不该写的页（代码段通常只读/可执行）；
+/// - 隔离与安全，不同进程、内核/用户的页权限不同。
+/// - 支持常见机制
+pub const PTE_VALID: u8 = 1 << 0; // 这页是否存在合法映射。
+pub const PTE_READ: u8 = 1 << 1; // 读操作需要 PTE_READ, 没权限就触发保护异常（不是“没映射”，而是“禁止这么用”）。
+pub const PTE_WRITE: u8 = 1 << 2; // 写操作需要 PTE_WRITE, 没权限就触发保护异常（不是“没映射”，而是“禁止这么用”）。
 
 /// 页表项
 #[derive(Clone, Copy, Debug)]
@@ -40,7 +56,7 @@ pub struct PageTableEntry {
 #[derive(Debug, PartialEq)]
 pub enum TranslateResult {
     /// 翻译成功，得到物理地址
-    Ok(u32),
+    Ok(u32), // 物理地址位数取决于架构设计，本练习使用32位物理地址。
     /// 缺页：虚拟页未映射
     PageFault,
     /// 权限错误：尝试写入只读页
@@ -63,21 +79,27 @@ impl SingleLevelPageTable {
     /// 将虚拟页号 `vpn` 映射到物理页号 `ppn`，并设置标志位 `flags`。
     ///
     /// 提示：在 `entries[vpn]` 处存放一个 `PageTableEntry`。
+    /// 
+    /// 检查 valid/read/write，发生在访问时（translate / load / store）。
+    /// 这个 map() 是在建映射时，把这些标志先写进对应的 PTE。
     pub fn map(&mut self, vpn: usize, ppn: u32, flags: u8) {
         // TODO: 在页表中建立 vpn -> ppn 的映射
-        todo!()
+        self.entries[vpn] = Some(PageTableEntry {ppn, flags});
     }
 
     /// 取消虚拟页号 `vpn` 的映射。
     pub fn unmap(&mut self, vpn: usize) {
         // TODO: 将 entries[vpn] 设为 None
-        todo!()
+        self.entries[vpn] = None;
     }
 
     /// 查询虚拟页号 `vpn` 对应的页表项。
     pub fn lookup(&self, vpn: usize) -> Option<&PageTableEntry> {
         // TODO: 返回 entries[vpn] 的引用（如果存在）
-        todo!()
+        if vpn >= self.entries.len() {
+            return None; // 超出页表范围
+        }
+        self.entries[vpn].as_ref()
     }
 
     /// 将虚拟地址翻译为物理地址。
@@ -88,12 +110,32 @@ impl SingleLevelPageTable {
     /// 3. 检查 PTE_VALID 标志，未置位返回 PageFault
     /// 4. 如果 `is_write` 为 true，检查 PTE_WRITE 标志
     /// 5. 计算物理地址 = ppn * PAGE_SIZE + offset
+    /// 
+    /// 因为 PPN 表示“第几个物理页”，offset 表示“该页内第几个字节”。
+    /// 物理内存按页连续排布时：
+    /// 第 PPN 页的起始地址 = PPN * PAGE_SIZE
+    /// 再加页内偏移 offset
+    /// 得到最终物理地址：PPN * PAGE_SIZE + offset
+    /// 
     pub fn translate(&self, va: u32, is_write: bool) -> TranslateResult {
         // TODO: 实现虚拟地址到物理地址的翻译
         // 提示：
         //   let vpn = (va >> PAGE_OFFSET_BITS) as usize;
         //   let offset = va & ((1 << PAGE_OFFSET_BITS) - 1);
-        todo!()
+        let vpn = va_to_vpn(va);
+        let offset = va_to_offset(va);
+        let pte = match self.lookup(vpn) {
+            Some(entry) => entry,
+            None => return TranslateResult::PageFault, // 未映射
+        };
+        if (pte.flags & PTE_VALID) == 0 {
+            return TranslateResult::PageFault; // 映射无效
+        }
+        if is_write && (pte.flags & PTE_WRITE) == 0 {
+            return TranslateResult::PermissionDenied; // 写权限不足
+        }
+        let pa = make_pa(pte.ppn, offset);
+        TranslateResult::Ok(pa)
     }
 }
 
@@ -102,7 +144,7 @@ impl SingleLevelPageTable {
 /// 提示：右移 PAGE_OFFSET_BITS 位。
 pub fn va_to_vpn(va: u32) -> usize {
     // TODO
-    todo!()
+    (va >> PAGE_OFFSET_BITS) as usize
 }
 
 /// 从虚拟地址中提取页内偏移。
@@ -110,13 +152,13 @@ pub fn va_to_vpn(va: u32) -> usize {
 /// 提示：用掩码提取低 PAGE_OFFSET_BITS 位。
 pub fn va_to_offset(va: u32) -> u32 {
     // TODO
-    todo!()
+    va & ((1 << PAGE_OFFSET_BITS) - 1)
 }
 
 /// 由物理页号和偏移量拼出物理地址。
 pub fn make_pa(ppn: u32, offset: u32) -> u32 {
     // TODO
-    todo!()
+    ppn * PAGE_SIZE as u32 + offset
 }
 
 #[cfg(test)]
