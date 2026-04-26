@@ -21,7 +21,7 @@
 /// TLB 条目
 #[derive(Clone, Debug)]
 pub struct TlbEntry {
-    pub valid: bool,
+    pub valid: bool, // 表示条目是否有效,false 表示无效（未使用或已被刷新）, 不能命中
     pub asid: u16,
     pub vpn: u64,
     pub ppn: u64,
@@ -91,7 +91,14 @@ impl Tlb {
         // TODO: 遍历 self.entries，查找 valid && vpn 匹配 && asid 匹配的条目
         // 命中：self.stats.hits += 1，返回 Some(entry.ppn)
         // 未命中：self.stats.misses += 1，返回 None
-        todo!()
+        for entry in self.entries.iter() {
+            if entry.valid && entry.vpn == vpn && entry.asid == asid {
+                self.stats.hits += 1;
+                return Some(entry.ppn);
+            }
+        }
+        self.stats.misses += 1;
+        None
     }
 
     /// 将一条新映射插入 TLB。
@@ -100,6 +107,11 @@ impl Tlb {
     /// 1. 先检查是否已存在相同 (vpn, asid) 的有效条目，如果有则更新它
     /// 2. 否则，写入 `fifo_ptr` 指向的位置
     /// 3. 将 `fifo_ptr` 前进到下一个位置（循环：`(fifo_ptr + 1) % capacity`）
+    /// 
+    /// 
+    /// TLB 满后，insert 不再找“空位”（因为没有）
+    /// 直接写 entries[fifo_ptr]
+    /// 然后 fifo_ptr = (fifo_ptr + 1) % capacity
     pub fn insert(&mut self, vpn: u64, ppn: u64, asid: u16, flags: u64) {
         // TODO: 实现 TLB 插入
         // 提示：
@@ -108,7 +120,23 @@ impl Tlb {
         //       if entry.valid && entry.vpn == vpn && entry.asid == asid { 更新并返回 }
         //   }
         //   写入 fifo_ptr 位置，然后推进指针
-        todo!()
+        for entry in &mut self.entries {
+            if entry.valid && entry.vpn == vpn && entry.asid == asid {
+                entry.ppn = ppn;
+                entry.flags = flags;
+                return;
+            }
+        }
+        // 写入fifo_ptr位置
+        self.entries[self.fifo_ptr] = TlbEntry {
+            valid: true,
+            asid,
+            vpn,
+            ppn,
+            flags,
+        };
+        // 推进 fifo_ptr
+        self.fifo_ptr = (self.fifo_ptr + 1) % self.capacity;
     }
 
     /// 刷新整个 TLB（将所有条目标记为无效）。
@@ -116,7 +144,9 @@ impl Tlb {
     /// 这对应于 RISC-V 的 `sfence.vma`（不带参数）操作。
     pub fn flush_all(&mut self) {
         // TODO: 将所有条目的 valid 设为 false
-        todo!()
+        for entry in &mut self.entries {
+            entry.valid = false;
+        }
     }
 
     /// 刷新指定虚拟页的 TLB 条目。
@@ -124,7 +154,11 @@ impl Tlb {
     /// 对应 `sfence.vma vaddr`：只刷新匹配 `vpn` 的条目（任意 ASID）。
     pub fn flush_by_vpn(&mut self, vpn: u64) {
         // TODO: 将所有 vpn 匹配的条目标记为无效
-        todo!()
+        for entry in &mut self.entries {
+            if entry.valid && entry.vpn == vpn {
+                entry.valid = false;
+            }
+        }
     }
 
     /// 刷新指定地址空间（ASID）的所有 TLB 条目。
@@ -132,13 +166,23 @@ impl Tlb {
     /// 对应 `sfence.vma zero, asid`：刷新该 ASID 的所有条目。
     pub fn flush_by_asid(&mut self, asid: u16) {
         // TODO: 将所有 asid 匹配的条目标记为无效
-        todo!()
+        for entry in &mut self.entries {
+            if entry.valid && entry.asid == asid {
+                entry.valid = false;
+            }
+        }
     }
 
     /// 返回当前有效条目的数量。
     pub fn valid_count(&self) -> usize {
         // TODO: 统计 valid == true 的条目数
-        todo!()
+        let mut count = 0;
+        for entry in &self.entries {
+            if entry.valid {
+                count += 1;
+            }
+        }        
+        count
     }
 }
 
@@ -173,7 +217,7 @@ impl Mmu {
         }
     }
 
-    /// 在页表中添加一条映射。
+    /// 在页表中添加一条映射。 (asid, vpn) -> (ppn, flags) 的映射。
     pub fn add_mapping(&mut self, asid: u16, vpn: u64, ppn: u64, flags: u64) {
         self.page_table
             .push((asid, PageMapping { vpn, ppn, flags }));
@@ -194,7 +238,20 @@ impl Mmu {
     /// 5. 页表未命中 → 返回 None（缺页）
     pub fn translate(&mut self, vpn: u64) -> Option<u64> {
         // TODO: 实现 TLB + 页表的二级查找
-        todo!()
+        // 查找TLB
+        if let Some(ppn) = self.tlb.lookup(vpn, self.current_asid) {
+            return Some(ppn);
+        }
+
+        // TLB未命中，查找页表
+        for (asid, mapping) in self.page_table.iter() {
+            if *asid == self.current_asid && mapping.vpn == vpn {
+                // 页表命中，回填TLB
+                self.tlb.insert(vpn, mapping.ppn, *asid, mapping.flags);
+                return Some(mapping.ppn);
+            }
+        }
+        None
     }
 }
 
